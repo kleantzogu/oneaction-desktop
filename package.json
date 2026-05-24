@@ -59,6 +59,7 @@
     ],
     "mac": {
       "category": "public.app-category.productivity",
+      "icon": "build/oneaction.icns",
       "target": [
         {
           "target": "dmg",

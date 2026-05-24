@@ -29,7 +29,7 @@ const SUPPORTED_FILE_EXTS: Record<string, string> = {
 const isDev = !app.isPackaged;
 const APP_URL = isDev
   ? (process.env.ONEACTION_DEV_URL ?? "http://localhost:3000")
-  : (process.env.ONEACTION_URL ?? "https://oneaction.app");
+  : (process.env.ONEACTION_URL ?? "https://app.oneaction.app/signin");
 
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
@@ -271,6 +271,11 @@ function createWindow() {
     minWidth: 800,
     minHeight: 600,
     title: "OneAction",
+    // Hide the title bar but keep the macOS traffic-light buttons inset so
+    // the webapp content extends to the top edge. Non-macOS keeps the
+    // default chrome (Windows/Linux don't have an equivalent native pattern).
+    titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
+    trafficLightPosition: { x: 16, y: 16 },
     webPreferences: {
       session: persistentSession,
       preload: path.join(__dirname, "preload.js"),
