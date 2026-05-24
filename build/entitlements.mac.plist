@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Required for V8 / Electron's JIT-compiled JavaScript under hardened runtime. -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+  <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+  <true/>
+
+  <!-- The renderer loads the hosted webapp and posts to /api/extract, so we
+       need outbound network access. -->
+  <key>com.apple.security.network.client</key>
+  <true/>
+
+  <!-- File open dialogs / drag-drop for PDF + EPUB attachments. -->
+  <key>com.apple.security.files.user-selected.read-only</key>
+  <true/>
+  <key>com.apple.security.files.user-selected.read-write</key>
+  <true/>
+
+  <!-- Required so Cmd+Shift+S can ask the active browser for its URL via
+       osascript. Without this, every send-Apple-event call from a hardened
+       binary fails immediately. -->
+  <key>com.apple.security.automation.apple-events</key>
+  <true/>
+</dict>
+</plist>

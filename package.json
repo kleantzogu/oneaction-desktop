@@ -75,13 +75,30 @@
             "x64"
           ]
         }
-      ]
+      ],
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "notarize": true,
+      "extendInfo": {
+        "NSAppleEventsUsageDescription": "Oneaction needs to read the URL of your active browser tab to capture it into your inbox when you press Cmd+Shift+S."
+      }
     },
     "win": {
       "target": "nsis"
     },
     "linux": {
-      "target": "AppImage",
+      "icon": "build/icon.png",
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
       "category": "Office"
     }
   }
