@@ -28,12 +28,16 @@
     },
     "files": [
       "dist/**/*",
+      "build/tray-icon.png",
+      "build/tray-icon@2x.png",
       "package.json"
     ],
     "protocols": [
       {
         "name": "OneAction",
-        "schemes": ["oneaction"],
+        "schemes": [
+          "oneaction"
+        ],
         "role": "Viewer"
       }
     ],
@@ -56,8 +60,29 @@
     "mac": {
       "category": "public.app-category.productivity",
       "target": [
-        { "target": "dmg", "arch": ["arm64", "x64"] },
-        { "target": "zip", "arch": ["arm64", "x64"] }
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ],
+      "extendInfo": {
+        "CFBundleIconName": "oneaction"
+      },
+      "extraResources": [
+        {
+          "from": "build/oneaction.icon",
+          "to": "oneaction.icon"
+        }
       ]
     },
     "win": {

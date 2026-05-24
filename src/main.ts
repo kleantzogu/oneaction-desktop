@@ -4,9 +4,12 @@ import {
   clipboard,
   globalShortcut,
   ipcMain,
+  Menu,
+  nativeImage,
   Notification,
   session,
   shell,
+  Tray,
 } from "electron";
 import { execFile } from "child_process";
 import * as fs from "fs/promises";
@@ -29,6 +32,11 @@ const APP_URL = isDev
   : (process.env.ONEACTION_URL ?? "https://oneaction.app");
 
 let mainWindow: BrowserWindow | null = null;
+let tray: Tray | null = null;
+
+// Distinguish a "real quit" (Cmd+Q, tray Quit menu) from a window-close so
+// the close-to-tray handler knows whether to actually close.
+let isQuitting = false;
 
 // Deep links / file opens can arrive before the renderer is ready (cold launch).
 // Queue them until the renderer signals it's listening.
@@ -122,6 +130,72 @@ function handleOpenFile(filePath: string) {
 function notify(body: string) {
   if (!Notification.isSupported()) return;
   new Notification({ title: "OneAction", body, silent: true }).show();
+}
+
+function trayIconImage() {
+  // Monochrome silhouette designed for macOS template behavior — macOS
+  // auto-inverts the pixel colors to match the menu bar (white in dark mode,
+  // black in light mode), matching how Slack/Notion/GitHub Desktop look.
+  // Electron auto-picks the @2x variant for Retina based on filename.
+  const sourcePath = path.join(__dirname, "..", "build", "tray-icon.png");
+  const img = nativeImage.createFromPath(sourcePath);
+  img.setTemplateImage(true);
+  return img;
+}
+
+function createTray() {
+  if (tray) return;
+  tray = new Tray(trayIconImage());
+  tray.setToolTip("OneAction");
+  rebuildTrayMenu();
+
+  // macOS opens the context menu on click for tray icons with a menu, which is
+  // standard. On Windows/Linux, click should toggle visibility — context menu
+  // appears on right-click.
+  if (process.platform !== "darwin") {
+    tray.on("click", () => {
+      if (!mainWindow) {
+        createWindow();
+        return;
+      }
+      if (mainWindow.isVisible() && mainWindow.isFocused()) {
+        mainWindow.hide();
+      } else {
+        focusMainWindow();
+      }
+    });
+  }
+}
+
+function rebuildTrayMenu() {
+  if (!tray) return;
+  const menu = Menu.buildFromTemplate([
+    {
+      label: "Open OneAction",
+      click: () => {
+        if (!mainWindow) createWindow();
+        else focusMainWindow();
+      },
+    },
+    { type: "separator" },
+    {
+      label: "Save active page",
+      accelerator: SAVE_CLIPBOARD_SHORTCUT,
+      click: () => {
+        void handleSaveActiveTab();
+      },
+    },
+    { type: "separator" },
+    {
+      label: "Quit OneAction",
+      accelerator: "CmdOrCtrl+Q",
+      click: () => {
+        isQuitting = true;
+        app.quit();
+      },
+    },
+  ]);
+  tray.setContextMenu(menu);
 }
 
 // AppleScript dictionaries: Safari uses `front document`; Chromium-based
@@ -230,6 +304,15 @@ function createWindow() {
   mainWindow.webContents.on("did-start-loading", resetRendererReady);
   mainWindow.webContents.on("did-start-navigation", resetRendererReady);
 
+  // Close-to-tray on macOS: hiding the window keeps the renderer (and any
+  // TTS / podcast playback) alive. Standard Slack-style. On Windows/Linux
+  // the X actually quits — closer to platform convention there.
+  mainWindow.on("close", (event) => {
+    if (isQuitting || process.platform !== "darwin") return;
+    event.preventDefault();
+    mainWindow?.hide();
+  });
+
   mainWindow.on("closed", () => {
     mainWindow = null;
     rendererReady = false;
@@ -283,8 +366,19 @@ if (!gotLock) {
     }
   });
 
+  // Cmd+Q (and any other quit path) needs to bypass the close-to-tray
+  // handler, otherwise the app never actually quits.
+  app.on("before-quit", () => {
+    isQuitting = true;
+  });
+
   app.whenReady().then(() => {
+    // Dock branding only kicks in for packaged builds, where macOS reads
+    // build/oneaction.icon via CFBundleIconName. In dev the dock shows
+    // Electron's atom — accepted trade-off, since faking it with a flat
+    // PNG diverges from how the catalog actually renders.
     createWindow();
+    createTray();
 
     for (const arg of process.argv) {
       if (arg.startsWith(`${PROTOCOL}://`)) {
@@ -305,7 +399,13 @@ if (!gotLock) {
     }
 
     app.on("activate", () => {
-      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+      // Dock-click after close-to-tray: window exists but is hidden — show it
+      // rather than create a duplicate.
+      if (!mainWindow) {
+        createWindow();
+      } else {
+        focusMainWindow();
+      }
     });
   });
 
