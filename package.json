@@ -37,6 +37,22 @@
         "role": "Viewer"
       }
     ],
+    "fileAssociations": [
+      {
+        "ext": "pdf",
+        "name": "PDF Document",
+        "description": "PDF document",
+        "mimeType": "application/pdf",
+        "role": "Viewer"
+      },
+      {
+        "ext": "epub",
+        "name": "EPUB eBook",
+        "description": "EPUB eBook",
+        "mimeType": "application/epub+zip",
+        "role": "Viewer"
+      }
+    ],
     "mac": {
       "category": "public.app-category.productivity",
       "target": [

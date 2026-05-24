@@ -1,7 +1,13 @@
 import { app, BrowserWindow, ipcMain, session, shell } from "electron";
+import * as fs from "fs/promises";
 import * as path from "path";
 
 const PROTOCOL = "oneaction";
+
+const SUPPORTED_FILE_EXTS: Record<string, string> = {
+  ".pdf": "application/pdf",
+  ".epub": "application/epub+zip",
+};
 
 const isDev = !app.isPackaged;
 const APP_URL = isDev
@@ -10,18 +16,16 @@ const APP_URL = isDev
 
 let mainWindow: BrowserWindow | null = null;
 
-// Deep links can arrive before the renderer is ready (cold launch via
-// `open oneaction://...`). Queue them until the renderer signals it's listening.
+// Deep links / file opens can arrive before the renderer is ready (cold launch).
+// Queue them until the renderer signals it's listening.
 let rendererReady = false;
 const pendingCaptureUrls: string[] = [];
+const pendingCaptureFiles: string[] = [];
 
 function extractCaptureUrl(deepLink: string): string | null {
   try {
     const u = new URL(deepLink);
     if (u.protocol !== `${PROTOCOL}:`) return null;
-    // Accept both `oneaction://save?url=...` (host = "save") and
-    // `oneaction:save?url=...` (pathname = "save") since Chromium parses
-    // these inconsistently across platforms.
     const action = (u.host || u.pathname.replace(/^\/+/, "")).toLowerCase();
     if (action !== "save") return null;
     const target = u.searchParams.get("url");
@@ -30,6 +34,13 @@ function extractCaptureUrl(deepLink: string): string | null {
   } catch {
     return null;
   }
+}
+
+function focusMainWindow() {
+  if (!mainWindow) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
 }
 
 function dispatchCapture(url: string) {
@@ -41,11 +52,35 @@ function dispatchCapture(url: string) {
   mainWindow.webContents.send("oneaction:capture", url);
 }
 
-function focusMainWindow() {
+async function dispatchCaptureFile(filePath: string) {
   if (!mainWindow) return;
-  if (mainWindow.isMinimized()) mainWindow.restore();
-  mainWindow.show();
-  mainWindow.focus();
+  if (!rendererReady) {
+    pendingCaptureFiles.push(filePath);
+    return;
+  }
+  await sendCaptureFile(filePath);
+}
+
+async function sendCaptureFile(filePath: string) {
+  if (!mainWindow) return;
+  const ext = path.extname(filePath).toLowerCase();
+  const mimeType = SUPPORTED_FILE_EXTS[ext];
+  if (!mimeType) {
+    console.warn(`[oneaction] ignored unsupported file type: ${filePath}`);
+    return;
+  }
+  try {
+    const buffer = await fs.readFile(filePath);
+    mainWindow.webContents.send("oneaction:capture-file", {
+      name: path.basename(filePath),
+      mimeType,
+      // Send the underlying ArrayBuffer slice so structured clone transmits
+      // it as a typed array without dragging the whole Buffer subclass.
+      bytes: new Uint8Array(buffer),
+    });
+  } catch (err) {
+    console.error(`[oneaction] failed to read ${filePath}:`, err);
+  }
 }
 
 function handleDeepLink(rawUrl: string) {
@@ -53,6 +88,13 @@ function handleDeepLink(rawUrl: string) {
   if (!captureUrl) return;
   focusMainWindow();
   dispatchCapture(captureUrl);
+}
+
+function handleOpenFile(filePath: string) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (!SUPPORTED_FILE_EXTS[ext]) return;
+  focusMainWindow();
+  void dispatchCaptureFile(filePath);
 }
 
 function createWindow() {
@@ -91,8 +133,6 @@ function createWindow() {
     return { action: "allow" };
   });
 
-  // Renderer state resets on every navigation/reload; require a fresh
-  // ready ping each time before dispatching.
   const resetRendererReady = () => {
     rendererReady = false;
   };
@@ -103,26 +143,25 @@ function createWindow() {
     mainWindow = null;
     rendererReady = false;
     pendingCaptureUrls.length = 0;
+    pendingCaptureFiles.length = 0;
   });
 }
 
-// Without a single-instance lock, every `open oneaction://...` would spawn
-// a fresh Electron process instead of activating the running one.
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
   app.on("second-instance", (_event, argv) => {
     focusMainWindow();
-    // Windows / Linux deliver the deep link in argv of the second instance.
     const deepLink = argv.find((arg) => arg.startsWith(`${PROTOCOL}://`));
     if (deepLink) handleDeepLink(deepLink);
+    // Windows / Linux deliver file paths in argv on second-instance launches.
+    for (const arg of argv) {
+      const ext = path.extname(arg).toLowerCase();
+      if (SUPPORTED_FILE_EXTS[ext]) handleOpenFile(arg);
+    }
   });
 
-  // The setAsDefaultProtocolClient call is a no-op in dev unless a path is
-  // passed; we pass process.execPath + the compiled entrypoint so macOS /
-  // Windows know how to relaunch us for an `oneaction://` URL while running
-  // `npm start`. In packaged builds, Electron handles this automatically.
   if (process.defaultApp && process.argv.length >= 2) {
     app.setAsDefaultProtocolClient(PROTOCOL, process.execPath, [
       path.resolve(process.argv[1]!),
@@ -131,30 +170,44 @@ if (!gotLock) {
     app.setAsDefaultProtocolClient(PROTOCOL);
   }
 
-  // macOS delivers deep links through the open-url event, not argv.
   app.on("open-url", (event, url) => {
     event.preventDefault();
     handleDeepLink(url);
   });
 
-  ipcMain.on("oneaction:renderer-ready", (event) => {
-    if (mainWindow && event.sender === mainWindow.webContents) {
-      rendererReady = true;
-      while (pendingCaptureUrls.length > 0) {
-        const next = pendingCaptureUrls.shift()!;
-        mainWindow.webContents.send("oneaction:capture", next);
-      }
+  // macOS delivers file drops / Open With / share extensions via open-file.
+  app.on("open-file", (event, filePath) => {
+    event.preventDefault();
+    handleOpenFile(filePath);
+  });
+
+  ipcMain.on("oneaction:renderer-ready", async (event) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) return;
+    rendererReady = true;
+    while (pendingCaptureUrls.length > 0) {
+      const next = pendingCaptureUrls.shift()!;
+      mainWindow.webContents.send("oneaction:capture", next);
+    }
+    // Files are processed sequentially since each read is async and we want
+    // deterministic delivery order.
+    while (pendingCaptureFiles.length > 0) {
+      const next = pendingCaptureFiles.shift()!;
+      await sendCaptureFile(next);
     }
   });
 
   app.whenReady().then(() => {
     createWindow();
 
-    // Windows / Linux cold launch: the deep link is in the initial argv.
-    const initialDeepLink = process.argv.find((arg) =>
-      arg.startsWith(`${PROTOCOL}://`),
-    );
-    if (initialDeepLink) handleDeepLink(initialDeepLink);
+    // Windows / Linux cold launch: deep links + file paths come in via argv.
+    for (const arg of process.argv) {
+      if (arg.startsWith(`${PROTOCOL}://`)) {
+        handleDeepLink(arg);
+        continue;
+      }
+      const ext = path.extname(arg).toLowerCase();
+      if (SUPPORTED_FILE_EXTS[ext]) handleOpenFile(arg);
+    }
 
     app.on("activate", () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
