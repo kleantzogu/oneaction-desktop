@@ -2,7 +2,7 @@
   "name": "oneaction-desktop",
   "version": "0.1.0",
   "private": true,
-  "description": "OneAction desktop app (Electron shell)",
+  "description": "Oneaction desktop app (Electron shell)",
   "main": "dist/main.js",
   "scripts": {
     "build": "tsc",
@@ -21,7 +21,7 @@
   },
   "build": {
     "appId": "app.oneaction.desktop",
-    "productName": "OneAction",
+    "productName": "Oneaction",
     "directories": {
       "output": "release",
       "buildResources": "build"
@@ -34,7 +34,7 @@
     ],
     "protocols": [
       {
-        "name": "OneAction",
+        "name": "Oneaction",
         "schemes": [
           "oneaction"
         ],
@@ -74,15 +74,6 @@
             "arm64",
             "x64"
           ]
-        }
-      ],
-      "extendInfo": {
-        "CFBundleIconName": "oneaction"
-      },
-      "extraResources": [
-        {
-          "from": "build/oneaction.icon",
-          "to": "oneaction.icon"
         }
       ]
     },

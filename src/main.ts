@@ -129,7 +129,7 @@ function handleOpenFile(filePath: string) {
 
 function notify(body: string) {
   if (!Notification.isSupported()) return;
-  new Notification({ title: "OneAction", body, silent: true }).show();
+  new Notification({ title: "Oneaction", body, silent: true }).show();
 }
 
 function trayIconImage() {
@@ -146,7 +146,7 @@ function trayIconImage() {
 function createTray() {
   if (tray) return;
   tray = new Tray(trayIconImage());
-  tray.setToolTip("OneAction");
+  tray.setToolTip("Oneaction");
   rebuildTrayMenu();
 
   // macOS opens the context menu on click for tray icons with a menu, which is
@@ -171,7 +171,7 @@ function rebuildTrayMenu() {
   if (!tray) return;
   const menu = Menu.buildFromTemplate([
     {
-      label: "Open OneAction",
+      label: "Open Oneaction",
       click: () => {
         if (!mainWindow) createWindow();
         else focusMainWindow();
@@ -187,7 +187,7 @@ function rebuildTrayMenu() {
     },
     { type: "separator" },
     {
-      label: "Quit OneAction",
+      label: "Quit Oneaction",
       accelerator: "CmdOrCtrl+Q",
       click: () => {
         isQuitting = true;
@@ -270,7 +270,7 @@ function createWindow() {
     height: 800,
     minWidth: 800,
     minHeight: 600,
-    title: "OneAction",
+    title: "Oneaction",
     // Hide the title bar but keep the macOS traffic-light buttons inset so
     // the webapp content extends to the top edge. Non-macOS keeps the
     // default chrome (Windows/Linux don't have an equivalent native pattern).
