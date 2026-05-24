@@ -1,8 +1,22 @@
-import { app, BrowserWindow, ipcMain, session, shell } from "electron";
+import {
+  app,
+  BrowserWindow,
+  clipboard,
+  globalShortcut,
+  ipcMain,
+  Notification,
+  session,
+  shell,
+} from "electron";
+import { execFile } from "child_process";
 import * as fs from "fs/promises";
 import * as path from "path";
+import { promisify } from "util";
+
+const execFileAsync = promisify(execFile);
 
 const PROTOCOL = "oneaction";
+const SAVE_CLIPBOARD_SHORTCUT = "CommandOrControl+Shift+S";
 
 const SUPPORTED_FILE_EXTS: Record<string, string> = {
   ".pdf": "application/pdf",
@@ -31,6 +45,16 @@ function extractCaptureUrl(deepLink: string): string | null {
     const target = u.searchParams.get("url");
     if (!target) return null;
     return target;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeCapturableUrl(text: string): string | null {
+  try {
+    const u = new URL(text.trim());
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    return u.toString();
   } catch {
     return null;
   }
@@ -74,8 +98,6 @@ async function sendCaptureFile(filePath: string) {
     mainWindow.webContents.send("oneaction:capture-file", {
       name: path.basename(filePath),
       mimeType,
-      // Send the underlying ArrayBuffer slice so structured clone transmits
-      // it as a typed array without dragging the whole Buffer subclass.
       bytes: new Uint8Array(buffer),
     });
   } catch (err) {
@@ -95,6 +117,75 @@ function handleOpenFile(filePath: string) {
   if (!SUPPORTED_FILE_EXTS[ext]) return;
   focusMainWindow();
   void dispatchCaptureFile(filePath);
+}
+
+function notify(body: string) {
+  if (!Notification.isSupported()) return;
+  new Notification({ title: "OneAction", body, silent: true }).show();
+}
+
+// AppleScript dictionaries: Safari uses `front document`; Chromium-based
+// browsers use `active tab of front window` and accept the app name dynamically.
+// Firefox has no AppleScript URL support and is intentionally omitted —
+// the clipboard fallback covers it.
+const ACTIVE_TAB_APPLESCRIPT = `
+tell application "System Events"
+  set frontApp to name of first application process whose frontmost is true
+end tell
+
+if frontApp is "Safari" then
+  tell application "Safari"
+    if (count of documents) > 0 then return URL of front document
+  end tell
+else if frontApp is in {"Google Chrome", "Google Chrome Canary", "Brave Browser", "Arc", "Microsoft Edge", "Vivaldi", "Opera"} then
+  using terms from application "Google Chrome"
+    tell application frontApp
+      if (count of windows) > 0 then return URL of active tab of front window
+    end tell
+  end using terms from
+end if
+return ""
+`;
+
+async function getActiveBrowserUrl(): Promise<string | null> {
+  if (process.platform !== "darwin") return null;
+  try {
+    const { stdout } = await execFileAsync("osascript", [
+      "-e",
+      ACTIVE_TAB_APPLESCRIPT,
+    ]);
+    return normalizeCapturableUrl(stdout);
+  } catch {
+    // Most likely cause: user has not granted automation permission yet,
+    // or no supported browser is frontmost. Either way fall through to
+    // the clipboard path so the shortcut still feels responsive.
+    return null;
+  }
+}
+
+async function handleSaveActiveTab() {
+  // Prefer the URL of the page the user is actively viewing — feels like
+  // magic. Clipboard is the fallback when no supported browser is frontmost.
+  const url =
+    (await getActiveBrowserUrl()) ??
+    normalizeCapturableUrl(clipboard.readText());
+
+  if (!url) {
+    notify(
+      "Open a page in Safari/Chrome (or copy a URL) and press the shortcut to save.",
+    );
+    return;
+  }
+  // Bring the app back if it was fully closed so the renderer can pick up the
+  // queued capture. Don't focus — the whole point of the shortcut is to save
+  // without context-switching.
+  if (!mainWindow) createWindow();
+  dispatchCapture(url);
+  try {
+    notify(`Saved from ${new URL(url).hostname.replace(/^www\./, "")}`);
+  } catch {
+    /* notification is just confirmation — never fatal */
+  }
 }
 
 function createWindow() {
@@ -155,7 +246,6 @@ if (!gotLock) {
     focusMainWindow();
     const deepLink = argv.find((arg) => arg.startsWith(`${PROTOCOL}://`));
     if (deepLink) handleDeepLink(deepLink);
-    // Windows / Linux deliver file paths in argv on second-instance launches.
     for (const arg of argv) {
       const ext = path.extname(arg).toLowerCase();
       if (SUPPORTED_FILE_EXTS[ext]) handleOpenFile(arg);
@@ -175,7 +265,6 @@ if (!gotLock) {
     handleDeepLink(url);
   });
 
-  // macOS delivers file drops / Open With / share extensions via open-file.
   app.on("open-file", (event, filePath) => {
     event.preventDefault();
     handleOpenFile(filePath);
@@ -188,8 +277,6 @@ if (!gotLock) {
       const next = pendingCaptureUrls.shift()!;
       mainWindow.webContents.send("oneaction:capture", next);
     }
-    // Files are processed sequentially since each read is async and we want
-    // deterministic delivery order.
     while (pendingCaptureFiles.length > 0) {
       const next = pendingCaptureFiles.shift()!;
       await sendCaptureFile(next);
@@ -199,7 +286,6 @@ if (!gotLock) {
   app.whenReady().then(() => {
     createWindow();
 
-    // Windows / Linux cold launch: deep links + file paths come in via argv.
     for (const arg of process.argv) {
       if (arg.startsWith(`${PROTOCOL}://`)) {
         handleDeepLink(arg);
@@ -209,9 +295,22 @@ if (!gotLock) {
       if (SUPPORTED_FILE_EXTS[ext]) handleOpenFile(arg);
     }
 
+    const registered = globalShortcut.register(SAVE_CLIPBOARD_SHORTCUT, () => {
+      void handleSaveActiveTab();
+    });
+    if (!registered) {
+      console.warn(
+        `[oneaction] failed to register global shortcut ${SAVE_CLIPBOARD_SHORTCUT} — likely already taken by another app`,
+      );
+    }
+
     app.on("activate", () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
     });
+  });
+
+  app.on("will-quit", () => {
+    globalShortcut.unregisterAll();
   });
 
   app.on("window-all-closed", () => {
