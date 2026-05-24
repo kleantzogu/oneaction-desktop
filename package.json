@@ -30,6 +30,13 @@
       "dist/**/*",
       "package.json"
     ],
+    "protocols": [
+      {
+        "name": "OneAction",
+        "schemes": ["oneaction"],
+        "role": "Viewer"
+      }
+    ],
     "mac": {
       "category": "public.app-category.productivity",
       "target": [
