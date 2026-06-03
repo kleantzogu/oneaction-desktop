@@ -75,9 +75,31 @@ let intervalTimer: NodeJS.Timeout | null = null;
 let timeoutTimer: NodeJS.Timeout | null = null;
 
 export function initAutoUpdates(deps: UpdateControllerDeps): void {
+  if (controller) return;
+
+  // Debug: simulate a downloaded update (any platform, even in dev) to verify the
+  // notification + tray item without publishing two releases. Inert unless
+  // ONEACTION_FAKE_UPDATE is set, so it is safe to leave in the codebase.
+  const fakeVersion = process.env.ONEACTION_FAKE_UPDATE;
+  if (fakeVersion) {
+    const listeners: Record<string, (info: any) => void> = {};
+    const fake: UpdaterLike = {
+      on(event: string, listener: (...args: any[]) => void) {
+        listeners[event] = listener;
+      },
+      checkForUpdates() {},
+      quitAndInstall() {
+        console.log("[oneaction-updater] (fake) quitAndInstall");
+      },
+    };
+    controller = createUpdateController(fake, deps);
+    controller.start();
+    listeners["update-downloaded"]?.({ version: fakeVersion });
+    return;
+  }
+
   // electron-updater no-ops in dev but logs noisy errors; only run when packaged.
   if (!app.isPackaged) return;
-  if (controller) return;
 
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
