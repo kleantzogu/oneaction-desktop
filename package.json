@@ -1,8 +1,9 @@
 {
   "name": "oneaction-desktop",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "Oneaction desktop app (Electron shell)",
+  "author": "Kleant Zogu <kzogu@ritech.co>",
   "main": "dist/main.js",
   "scripts": {
     "build": "tsc",
@@ -11,7 +12,8 @@
     "package": "npm run build && electron-builder",
     "package:mac": "npm run build && electron-builder --mac",
     "package:mac:notarized": "node scripts/verify-mac-notarization-env.js && npm run package:mac",
-    "package:linux": "npm run build && electron-builder --linux"
+    "package:linux": "npm run build && electron-builder --linux",
+    "test": "tsc -p tsconfig.test.json && node --test 'dist-test/**/*.test.js'"
   },
   "devDependencies": {
     "@types/node": "^22.9.0",
@@ -25,6 +27,11 @@
     "directories": {
       "output": "release",
       "buildResources": "build"
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "kleantzogu",
+      "repo": "oneaction-desktop"
     },
     "files": [
       "dist/**/*",
@@ -98,5 +105,8 @@
       ],
       "category": "Office"
     }
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.3"
   }
 }
