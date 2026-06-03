@@ -1,3 +1,6 @@
+import { app } from "electron";
+import { autoUpdater } from "electron-updater";
+
 export interface UpdaterLike {
   on(event: string, listener: (...args: any[]) => void): unknown;
   checkForUpdates(): Promise<unknown> | unknown;
@@ -62,4 +65,52 @@ export function createUpdateController(
     getPendingUpdate: () => pending,
     quitAndInstall: () => updater.quitAndInstall(),
   };
+}
+
+const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
+const FIRST_CHECK_DELAY_MS = 8_000; // let the window settle before first check
+
+let controller: UpdateController | null = null;
+let intervalTimer: NodeJS.Timeout | null = null;
+let timeoutTimer: NodeJS.Timeout | null = null;
+
+export function initAutoUpdates(deps: UpdateControllerDeps): void {
+  // electron-updater no-ops in dev but logs noisy errors; only run when packaged.
+  if (!app.isPackaged) return;
+  if (controller) return;
+
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+  // Route updater logs to console (electron-updater accepts any info/warn/error logger).
+  autoUpdater.logger = console as unknown as typeof autoUpdater.logger;
+
+  const log = (message: string) => console.log(`[oneaction-updater] ${message}`);
+  controller = createUpdateController(autoUpdater as unknown as UpdaterLike, {
+    ...deps,
+    log,
+  });
+  controller.start();
+
+  timeoutTimer = setTimeout(() => controller?.checkNow(), FIRST_CHECK_DELAY_MS);
+  intervalTimer = setInterval(() => controller?.checkNow(), CHECK_INTERVAL_MS);
+}
+
+export function getPendingUpdate(): PendingUpdate | null {
+  return controller?.getPendingUpdate() ?? null;
+}
+
+export function quitAndInstallUpdate(): void {
+  controller?.quitAndInstall();
+}
+
+export function disposeAutoUpdates(): void {
+  if (timeoutTimer) {
+    clearTimeout(timeoutTimer);
+    timeoutTimer = null;
+  }
+  if (intervalTimer) {
+    clearInterval(intervalTimer);
+    intervalTimer = null;
+  }
+  controller = null;
 }
