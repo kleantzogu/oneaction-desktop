@@ -17,6 +17,12 @@ import * as path from "path";
 import { promisify } from "util";
 import { CaptureOutbox, CaptureOutboxItem } from "./captureOutbox";
 import { offlineFallbackHtml } from "./offlineFallback";
+import {
+  initAutoUpdates,
+  getPendingUpdate,
+  quitAndInstallUpdate,
+  disposeAutoUpdates,
+} from "./autoUpdate";
 
 const execFileAsync = promisify(execFile);
 
@@ -383,6 +389,7 @@ function rebuildTrayMenu() {
   const waitingCount = status.queuedCount + status.deliveredCount;
   const outboxLabel =
     waitingCount === 1 ? "1 capture waiting" : `${waitingCount} captures waiting`;
+  const pendingUpdate = getPendingUpdate();
   const menu = Menu.buildFromTemplate([
     {
       label: "Open Oneaction",
@@ -423,6 +430,18 @@ function rebuildTrayMenu() {
       },
     },
     { type: "separator" },
+    ...(pendingUpdate
+      ? ([
+          {
+            label: `Restart to update Oneaction (v${pendingUpdate.version})`,
+            click: () => {
+              isQuitting = true;
+              quitAndInstallUpdate();
+            },
+          },
+          { type: "separator" },
+        ] as Electron.MenuItemConstructorOptions[])
+      : []),
     {
       label: "Quit Oneaction",
       accelerator: "CmdOrCtrl+Q",
@@ -708,6 +727,8 @@ if (!gotLock) {
     // PNG diverges from how the catalog actually renders.
     createWindow();
     createTray();
+    // Auto-updates: check GitHub Releases on launch + every 6h, notify on download.
+    initAutoUpdates({ notify, onStateChange: rebuildTrayMenu });
 
     for (const arg of process.argv) {
       if (arg.startsWith(`${PROTOCOL}://`)) {
@@ -742,6 +763,7 @@ if (!gotLock) {
 
   app.on("will-quit", () => {
     globalShortcut.unregisterAll();
+    disposeAutoUpdates();
   });
 
   app.on("window-all-closed", () => {
