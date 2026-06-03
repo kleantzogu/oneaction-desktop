@@ -6,20 +6,25 @@ import {
   ipcMain,
   Menu,
   nativeImage,
+  net,
   Notification,
   session,
   shell,
   Tray,
 } from "electron";
 import { execFile } from "child_process";
-import * as fs from "fs/promises";
 import * as path from "path";
 import { promisify } from "util";
+import { CaptureOutbox, CaptureOutboxItem } from "./captureOutbox";
+import { offlineFallbackHtml } from "./offlineFallback";
 
 const execFileAsync = promisify(execFile);
 
 const PROTOCOL = "oneaction";
 const SAVE_CLIPBOARD_SHORTCUT = "CommandOrControl+Shift+S";
+const CAPTURE_RETRY_INTERVAL_MS = 30_000;
+const APP_RECOVERY_CHECK_INTERVAL_MS = 20_000;
+const APP_RECOVERY_CHECK_TIMEOUT_MS = 5_000;
 
 const SUPPORTED_FILE_EXTS: Record<string, string> = {
   ".pdf": "application/pdf",
@@ -33,16 +38,23 @@ const APP_URL = isDev
 
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
+let captureOutbox: CaptureOutbox | null = null;
+let retryTimer: NodeJS.Timeout | null = null;
+let recoveryTimer: NodeJS.Timeout | null = null;
+let recoveryCheckInProgress = false;
+let deliveryInProgress = false;
+let rendererOnline = true;
+let isShowingOfflineFallback = false;
 
 // Distinguish a "real quit" (Cmd+Q, tray Quit menu) from a window-close so
 // the close-to-tray handler knows whether to actually close.
 let isQuitting = false;
 
 // Deep links / file opens can arrive before the renderer is ready (cold launch).
-// Queue them until the renderer signals it's listening.
+// Queue them until the outbox has initialized.
 let rendererReady = false;
-const pendingCaptureUrls: string[] = [];
-const pendingCaptureFiles: string[] = [];
+const startupCaptureUrls: string[] = [];
+const startupCaptureFiles: string[] = [];
 
 function extractCaptureUrl(deepLink: string): string | null {
   try {
@@ -75,41 +87,239 @@ function focusMainWindow() {
   mainWindow.focus();
 }
 
-function dispatchCapture(url: string) {
-  if (!mainWindow) return;
-  if (!rendererReady) {
-    pendingCaptureUrls.push(url);
-    return;
-  }
-  mainWindow.webContents.send("oneaction:capture", url);
+function offlineFallbackUrl() {
+  return `data:text/html;charset=utf-8,${encodeURIComponent(
+    offlineFallbackHtml(APP_URL),
+  )}`;
 }
 
-async function dispatchCaptureFile(filePath: string) {
+function loadRemoteApp() {
   if (!mainWindow) return;
-  if (!rendererReady) {
-    pendingCaptureFiles.push(filePath);
-    return;
-  }
-  await sendCaptureFile(filePath);
+  stopRecoveryChecks();
+  isShowingOfflineFallback = false;
+  rendererReady = false;
+  emitSyncStatusChanged();
+  void mainWindow.loadURL(APP_URL);
 }
 
-async function sendCaptureFile(filePath: string) {
-  if (!mainWindow) return;
+function loadOfflineFallback(errorDescription?: string) {
+  if (!mainWindow || isShowingOfflineFallback) return;
+  isShowingOfflineFallback = true;
+  rendererReady = false;
+  if (errorDescription) {
+    console.warn(`[oneaction] loading offline fallback: ${errorDescription}`);
+  }
+  emitSyncStatusChanged();
+  void mainWindow.loadURL(offlineFallbackUrl());
+  scheduleRecoveryCheck();
+}
+
+function ensureCaptureOutbox(): CaptureOutbox {
+  if (!captureOutbox) {
+    throw new Error("capture outbox is not initialized");
+  }
+  return captureOutbox;
+}
+
+function publicOutboxItems() {
+  return captureOutbox?.list() ?? [];
+}
+
+function syncStatus() {
+  const items = publicOutboxItems();
+  return {
+    rendererReady,
+    online: rendererOnline,
+    queuedCount: items.filter((item) => item.status === "queued").length,
+    deliveredCount: items.filter((item) => item.status === "delivered").length,
+    retryIntervalMs: CAPTURE_RETRY_INTERVAL_MS,
+  };
+}
+
+function emitOutboxChanged() {
+  rebuildTrayMenu();
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send(
+    "oneaction:capture-outbox-changed",
+    publicOutboxItems(),
+  );
+  mainWindow.webContents.send(
+    "oneaction:sync-status-changed",
+    syncStatus(),
+  );
+}
+
+function emitSyncStatusChanged() {
+  rebuildTrayMenu();
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send(
+    "oneaction:sync-status-changed",
+    syncStatus(),
+  );
+}
+
+function emitRecoveryStatus(message: string, checking: boolean) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send("oneaction:recovery-status-changed", {
+    checking,
+    message,
+  });
+}
+
+function stopRecoveryChecks() {
+  if (recoveryTimer) clearTimeout(recoveryTimer);
+  recoveryTimer = null;
+  recoveryCheckInProgress = false;
+}
+
+function scheduleRecoveryCheck(delayMs = APP_RECOVERY_CHECK_INTERVAL_MS) {
+  if (!isShowingOfflineFallback) return;
+  if (recoveryTimer) clearTimeout(recoveryTimer);
+  recoveryTimer = setTimeout(() => {
+    recoveryTimer = null;
+    void checkRemoteAppRecovery();
+  }, delayMs);
+}
+
+async function isRemoteAppReachable() {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, APP_RECOVERY_CHECK_TIMEOUT_MS);
+  try {
+    if (!net.isOnline()) return false;
+    const response = await net.fetch(APP_URL, {
+      method: "HEAD",
+      signal: controller.signal,
+    });
+    if (response.ok) return true;
+    if (response.status === 405 || response.status === 403) {
+      const fallback = await net.fetch(APP_URL, {
+        method: "GET",
+        signal: controller.signal,
+      });
+      return fallback.ok;
+    }
+    return false;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function checkRemoteAppRecovery() {
+  if (!isShowingOfflineFallback || recoveryCheckInProgress) return;
+  recoveryCheckInProgress = true;
+  emitRecoveryStatus("Checking Oneaction...", true);
+  const reachable = await isRemoteAppReachable();
+  recoveryCheckInProgress = false;
+  if (!isShowingOfflineFallback) return;
+  if (reachable) {
+    emitRecoveryStatus("Oneaction is back online.", false);
+    loadRemoteApp();
+    return;
+  }
+  emitRecoveryStatus("Still offline. Captures stay local.", false);
+  scheduleRecoveryCheck();
+}
+
+function scheduleCaptureDelivery(delayMs = 0) {
+  if (retryTimer) clearTimeout(retryTimer);
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    void drainQueuedCaptures();
+  }, delayMs);
+}
+
+async function dispatchCaptureItem(item: CaptureOutboxItem): Promise<boolean> {
+  if (!mainWindow) return false;
+  if (!rendererReady || !rendererOnline) return false;
+  try {
+    if (item.kind === "url") {
+      mainWindow.webContents.send("oneaction:capture-item", item);
+    } else {
+      const bytes = await ensureCaptureOutbox().readFileBytes(item);
+      mainWindow.webContents.send("oneaction:capture-item", {
+        id: item.id,
+        kind: item.kind,
+        status: item.status,
+        createdAt: item.createdAt,
+        updatedAt: item.updatedAt,
+        name: item.name,
+        mimeType: item.mimeType,
+        size: item.size,
+        bytes,
+      });
+    }
+    await ensureCaptureOutbox().markDelivered(item.id);
+    emitOutboxChanged();
+    return true;
+  } catch (err) {
+    console.error(`[oneaction] failed to dispatch capture ${item.id}:`, err);
+    await ensureCaptureOutbox().markDeliveryFailed(item.id, err);
+    emitOutboxChanged();
+    return false;
+  }
+}
+
+async function drainQueuedCaptures() {
+  if (!rendererReady || !captureOutbox) return;
+  if (!rendererOnline || deliveryInProgress) {
+    emitSyncStatusChanged();
+    return;
+  }
+  deliveryInProgress = true;
+  try {
+    for (const item of captureOutbox.queued()) {
+      await dispatchCaptureItem(item);
+    }
+  } finally {
+    deliveryInProgress = false;
+    if (captureOutbox.queued().length > 0) {
+      scheduleCaptureDelivery(CAPTURE_RETRY_INTERVAL_MS);
+    }
+  }
+}
+
+async function enqueueCaptureUrl(url: string) {
+  if (!captureOutbox) {
+    startupCaptureUrls.push(url);
+    return;
+  }
+  await captureOutbox.enqueueUrl(url);
+  emitOutboxChanged();
+  scheduleCaptureDelivery();
+}
+
+async function enqueueCaptureFile(filePath: string) {
   const ext = path.extname(filePath).toLowerCase();
   const mimeType = SUPPORTED_FILE_EXTS[ext];
   if (!mimeType) {
     console.warn(`[oneaction] ignored unsupported file type: ${filePath}`);
     return;
   }
+  if (!captureOutbox) {
+    startupCaptureFiles.push(filePath);
+    return;
+  }
   try {
-    const buffer = await fs.readFile(filePath);
-    mainWindow.webContents.send("oneaction:capture-file", {
-      name: path.basename(filePath),
-      mimeType,
-      bytes: new Uint8Array(buffer),
-    });
+    await captureOutbox.enqueueFile(filePath, mimeType);
+    emitOutboxChanged();
+    scheduleCaptureDelivery();
   } catch (err) {
-    console.error(`[oneaction] failed to read ${filePath}:`, err);
+    console.error(`[oneaction] failed to queue ${filePath}:`, err);
+  }
+}
+
+async function flushStartupCaptures() {
+  while (startupCaptureUrls.length > 0) {
+    const next = startupCaptureUrls.shift()!;
+    await enqueueCaptureUrl(next);
+  }
+  while (startupCaptureFiles.length > 0) {
+    const next = startupCaptureFiles.shift()!;
+    await enqueueCaptureFile(next);
   }
 }
 
@@ -117,14 +327,14 @@ function handleDeepLink(rawUrl: string) {
   const captureUrl = extractCaptureUrl(rawUrl);
   if (!captureUrl) return;
   focusMainWindow();
-  dispatchCapture(captureUrl);
+  void enqueueCaptureUrl(captureUrl);
 }
 
 function handleOpenFile(filePath: string) {
   const ext = path.extname(filePath).toLowerCase();
   if (!SUPPORTED_FILE_EXTS[ext]) return;
   focusMainWindow();
-  void dispatchCaptureFile(filePath);
+  void enqueueCaptureFile(filePath);
 }
 
 function notify(body: string) {
@@ -169,6 +379,10 @@ function createTray() {
 
 function rebuildTrayMenu() {
   if (!tray) return;
+  const status = syncStatus();
+  const waitingCount = status.queuedCount + status.deliveredCount;
+  const outboxLabel =
+    waitingCount === 1 ? "1 capture waiting" : `${waitingCount} captures waiting`;
   const menu = Menu.buildFromTemplate([
     {
       label: "Open Oneaction",
@@ -177,12 +391,35 @@ function rebuildTrayMenu() {
         else focusMainWindow();
       },
     },
+    {
+      label: waitingCount > 0 ? outboxLabel : "No captures waiting",
+      enabled: false,
+    },
     { type: "separator" },
     {
       label: "Save active page",
       accelerator: SAVE_CLIPBOARD_SHORTCUT,
       click: () => {
         void handleSaveActiveTab();
+      },
+    },
+    {
+      label: "Open offline queue",
+      enabled: waitingCount > 0 || isShowingOfflineFallback,
+      click: () => {
+        if (!mainWindow) createWindow();
+        else focusMainWindow();
+        if (!isShowingOfflineFallback) loadOfflineFallback();
+        mainWindow?.webContents.send("oneaction:open-offline-queue");
+      },
+    },
+    {
+      label: "Retry app",
+      enabled: isShowingOfflineFallback,
+      click: () => {
+        if (!mainWindow) createWindow();
+        else focusMainWindow();
+        loadRemoteApp();
       },
     },
     { type: "separator" },
@@ -254,9 +491,9 @@ async function handleSaveActiveTab() {
   // queued capture. Don't focus — the whole point of the shortcut is to save
   // without context-switching.
   if (!mainWindow) createWindow();
-  dispatchCapture(url);
+  await enqueueCaptureUrl(url);
   try {
-    notify(`Saved from ${new URL(url).hostname.replace(/^www\./, "")}`);
+    notify(`Queued from ${new URL(url).hostname.replace(/^www\./, "")}`);
   } catch {
     /* notification is just confirmation — never fatal */
   }
@@ -289,8 +526,6 @@ function createWindow() {
     `${currentUA} OneActionDesktop/${app.getVersion()}`,
   );
 
-  mainWindow.loadURL(APP_URL);
-
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     try {
       if (new URL(url).origin !== new URL(APP_URL).origin) {
@@ -305,9 +540,21 @@ function createWindow() {
 
   const resetRendererReady = () => {
     rendererReady = false;
+    emitSyncStatusChanged();
   };
   mainWindow.webContents.on("did-start-loading", resetRendererReady);
   mainWindow.webContents.on("did-start-navigation", resetRendererReady);
+  mainWindow.webContents.on(
+    "did-fail-load",
+    (_event, _errorCode, errorDescription, validatedURL, isMainFrame) => {
+      if (!isMainFrame || isShowingOfflineFallback) return;
+      if (validatedURL === APP_URL || validatedURL.startsWith(APP_URL)) {
+        loadOfflineFallback(errorDescription);
+      }
+    },
+  );
+
+  loadRemoteApp();
 
   // Close-to-tray on macOS: hiding the window keeps the renderer (and any
   // TTS / podcast playback) alive. Standard Slack-style. On Windows/Linux
@@ -321,8 +568,6 @@ function createWindow() {
   mainWindow.on("closed", () => {
     mainWindow = null;
     rendererReady = false;
-    pendingCaptureUrls.length = 0;
-    pendingCaptureFiles.length = 0;
   });
 }
 
@@ -361,14 +606,90 @@ if (!gotLock) {
   ipcMain.on("oneaction:renderer-ready", async (event) => {
     if (!mainWindow || event.sender !== mainWindow.webContents) return;
     rendererReady = true;
-    while (pendingCaptureUrls.length > 0) {
-      const next = pendingCaptureUrls.shift()!;
-      mainWindow.webContents.send("oneaction:capture", next);
+    emitOutboxChanged();
+    scheduleCaptureDelivery();
+  });
+
+  ipcMain.on("oneaction:renderer-online-status", (_event, online) => {
+    if (typeof online !== "boolean") return;
+    const wasOnline = rendererOnline;
+    rendererOnline = online;
+    emitSyncStatusChanged();
+    if (!wasOnline && rendererOnline) {
+      scheduleCaptureDelivery();
     }
-    while (pendingCaptureFiles.length > 0) {
-      const next = pendingCaptureFiles.shift()!;
-      await sendCaptureFile(next);
+  });
+
+  ipcMain.handle("oneaction:get-capture-outbox", () => {
+    return publicOutboxItems();
+  });
+
+  ipcMain.handle("oneaction:get-sync-status", () => {
+    return syncStatus();
+  });
+
+  ipcMain.handle("oneaction:retry-app-load", () => {
+    loadRemoteApp();
+  });
+
+  ipcMain.handle("oneaction:capture-url", async (event, rawUrl) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) {
+      return publicOutboxItems();
     }
+    if (typeof rawUrl !== "string") return publicOutboxItems();
+    const url = normalizeCapturableUrl(rawUrl);
+    if (!url) return publicOutboxItems();
+    await enqueueCaptureUrl(url);
+    return publicOutboxItems();
+  });
+
+  ipcMain.handle("oneaction:mark-capture-synced", async (_event, id) => {
+    if (typeof id !== "string") return publicOutboxItems();
+    await captureOutbox?.remove(id);
+    emitOutboxChanged();
+    return publicOutboxItems();
+  });
+
+  ipcMain.handle("oneaction:remove-capture-outbox-item", async (_event, id) => {
+    if (typeof id !== "string") return publicOutboxItems();
+    await captureOutbox?.remove(id);
+    emitOutboxChanged();
+    return publicOutboxItems();
+  });
+
+  ipcMain.handle("oneaction:redeliver-capture-outbox-item", async (_event, id) => {
+    if (typeof id !== "string" || !captureOutbox) return false;
+    const item = captureOutbox.get(id);
+    if (!item) return false;
+    return dispatchCaptureItem(item);
+  });
+
+  ipcMain.handle("oneaction:open-capture-outbox-item", async (_event, id) => {
+    if (typeof id !== "string" || !captureOutbox) return false;
+    const item = captureOutbox.get(id);
+    if (!item) return false;
+    if (item.kind === "url") {
+      await shell.openExternal(item.url);
+      return true;
+    }
+    const error = await shell.openPath(item.filePath);
+    if (error) {
+      console.warn(`[oneaction] failed to open ${item.filePath}: ${error}`);
+      return false;
+    }
+    return true;
+  });
+
+  ipcMain.handle("oneaction:capture-dropped-files", async (event, filePaths) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) {
+      return publicOutboxItems();
+    }
+    if (!Array.isArray(filePaths)) return publicOutboxItems();
+    for (const filePath of filePaths) {
+      if (typeof filePath !== "string") continue;
+      await enqueueCaptureFile(filePath);
+    }
+    return publicOutboxItems();
   });
 
   // Cmd+Q (and any other quit path) needs to bypass the close-to-tray
@@ -377,7 +698,10 @@ if (!gotLock) {
     isQuitting = true;
   });
 
-  app.whenReady().then(() => {
+  app.whenReady().then(async () => {
+    captureOutbox = new CaptureOutbox(app.getPath("userData"));
+    await captureOutbox.load();
+
     // Dock branding only kicks in for packaged builds, where macOS reads
     // build/oneaction.icon via CFBundleIconName. In dev the dock shows
     // Electron's atom — accepted trade-off, since faking it with a flat
@@ -393,6 +717,8 @@ if (!gotLock) {
       const ext = path.extname(arg).toLowerCase();
       if (SUPPORTED_FILE_EXTS[ext]) handleOpenFile(arg);
     }
+
+    await flushStartupCaptures();
 
     const registered = globalShortcut.register(SAVE_CLIPBOARD_SHORTCUT, () => {
       void handleSaveActiveTab();

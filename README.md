@@ -8,6 +8,11 @@ Native desktop shell for [Oneaction](https://app.oneaction.app), built with Elec
 - **Global shortcut `⌘⇧S` / `Ctrl+Shift+S`** — grabs the URL of the frontmost browser tab (Safari, Chrome, Brave, Arc, Edge, Vivaldi, Opera) via AppleScript on macOS, with a clipboard fallback, and saves it to Oneaction.
 - **Deep links** — `oneaction://save?url=…` routes capture requests from the browser or other apps.
 - **File associations** — opening a `.pdf` or `.epub` via the OS, dock drop, or "Open With" forwards the file bytes to the app.
+- **Offline capture outbox** — URL and PDF/EPUB captures are persisted locally before delivery to the renderer, so captures made while the web app is unavailable can be delivered later.
+- **Capture retry status** — queued captures are retried when the renderer becomes ready or the app comes back online, with delivery attempt metadata exposed to the web app.
+- **Offline fallback UI** — when the hosted app cannot load, Electron shows a centered local recovery state; the detailed outbox opens only when the user chooses to inspect it.
+- **Tray outbox status** — the tray menu shows waiting capture counts and can open the offline queue or retry the hosted app.
+- **Automatic app recovery** — while the local fallback is showing, Electron quietly probes the hosted app and reloads it when it becomes reachable again.
 - **Persistent session** — login survives restarts via a dedicated Electron session partition.
 - **Single-instance** — relaunching focuses the existing window and forwards any deep link / file argument.
 - **Custom user agent** — appends `OneActionDesktop/<version>` so the web app can detect the desktop client.
@@ -67,6 +72,8 @@ Artifacts are written to `release/`. macOS builds are currently unsigned.
 src/
   main.ts          # Electron main process: window, tray, shortcut, deep links, file opens
   preload.ts       # contextBridge → window.oneactionDesktop API
+  captureOutbox.ts # durable local capture queue
+  offlineFallback.ts # bundled fallback UI for failed remote loads
 build/
   oneaction.icns   # app icon (macOS)
   tray-icon.png    # template tray icon (macOS auto-inverts for dark/light)
@@ -80,10 +87,34 @@ The preload exposes a minimal API to the web app via `window.oneactionDesktop`:
 
 ```ts
 onCapture((url: string) => void): () => void
-onCaptureFile(({ name, mimeType, bytes }) => void): () => void
+onCaptureFile(({ id, name, mimeType, size, bytes }) => void): () => void
+onCaptureItem((item) => void): () => void
+getCaptureOutbox(): Promise<CaptureOutboxItem[]>
+getSyncStatus(): Promise<SyncStatus>
+markCaptureSynced(id: string): Promise<CaptureOutboxItem[]>
+removeCaptureOutboxItem(id: string): Promise<CaptureOutboxItem[]>
+redeliverCaptureOutboxItem(id: string): Promise<boolean>
+openCaptureOutboxItem(id: string): Promise<boolean>
+retryAppLoad(): Promise<void>
+captureDroppedFiles(files: File[]): Promise<CaptureOutboxItem[]>
+captureUrl(url: string): Promise<CaptureOutboxItem[]>
+onFileDragChanged((isDragging: boolean) => void): () => void
+onDroppedFilesCaptured((items: CaptureOutboxItem[]) => void): () => void
+onOpenOfflineQueue(() => void): () => void
+onCaptureOutboxChanged((items: CaptureOutboxItem[]) => void): () => void
+onSyncStatusChanged((status: SyncStatus) => void): () => void
+onRecoveryStatusChanged((status: RecoveryStatus) => void): () => void
 ```
 
-Both return a cleanup function. The renderer should register listeners on mount — the main process queues any deep link or file arriving before the renderer is ready and flushes the queue once `oneaction:renderer-ready` fires.
+The legacy `onCapture` and `onCaptureFile` APIs remain available, but new renderer code should prefer `onCaptureItem` because each capture includes a stable local outbox `id`.
+
+The main process writes captures to the local outbox before delivery. When the renderer registers a listener and reports online status, queued items are delivered and marked `delivered`; they remain in the outbox until the web app confirms successful upload with `markCaptureSynced(id)`. Use `getCaptureOutbox()` on startup to inspect local captures that still need server sync, `getSyncStatus()` / `onSyncStatusChanged()` to render retry state, and `redeliverCaptureOutboxItem(id)` when the user manually retries an item.
+
+`CaptureOutboxItem` includes `deliveryAttempts`, `lastDeliveredAt`, and `lastError` so the renderer can distinguish never-delivered local captures from captures that were handed to the web app but not yet acknowledged by the server.
+
+If the main app URL fails to load, the desktop shell swaps to a local offline fallback page bundled in the app. The fallback first shows a centered recovery state with retry and queue actions. Opening the queue uses the same outbox APIs to show queued and delivered local captures, remove abandoned items, and call `retryAppLoad()` to attempt the hosted app again. Dropping PDF/EPUB files onto the fallback page calls `captureDroppedFiles(files)` and queues supported files locally; pasting an HTTP(S) URL calls `captureUrl(url)`.
+
+Queued files can be opened from their local outbox copy with `openCaptureOutboxItem(id)`. URL items open externally.
 
 ## Deep-link contract
 
