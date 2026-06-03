@@ -7,3 +7,6 @@ out/
 *.log
 .DS_Store
 dist-test/
+
+# Local AI-assisted dev artifacts (spec/plan) — keep out of the public repo
+docs/superpowers/
