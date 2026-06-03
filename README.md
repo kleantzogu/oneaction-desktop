@@ -16,7 +16,7 @@ Native desktop shell for [Oneaction](https://app.oneaction.app), built with Elec
 - **Persistent session** — login survives restarts via a dedicated Electron session partition.
 - **Single-instance** — relaunching focuses the existing window and forwards any deep link / file argument.
 - **Custom user agent** — appends `OneActionDesktop/<version>` so the web app can detect the desktop client.
-- **Native window chrome** — hidden inset title bar on macOS (traffic-light buttons only); native chrome on Windows/Linux.
+- **Native window chrome** — hidden inset title bar on macOS (traffic-light buttons only); native chrome on Linux.
 
 ## Requirements
 
@@ -24,7 +24,6 @@ Native desktop shell for [Oneaction](https://app.oneaction.app), built with Elec
 - npm 10+
 - Platform tooling for packaging:
   - **macOS** — Xcode Command Line Tools
-  - **Windows** — Windows 10+ for NSIS targets
   - **Linux** — standard build essentials for AppImage
 
 ## Install
@@ -53,11 +52,17 @@ ONEACTION_DEV_URL=http://localhost:3001 npm start
 ```bash
 npm run package         # current platform
 npm run package:mac     # macOS (dmg + zip, arm64 + x64)
-npm run package:win     # Windows (NSIS)
+npm run package:mac:notarized
 npm run package:linux   # Linux (AppImage)
 ```
 
-Artifacts are written to `release/`. macOS builds are currently unsigned.
+Artifacts are written to `release/`. Windows builds are intentionally not produced until Windows code signing is configured.
+
+`npm run package:mac:notarized` performs a notarization credential preflight before running the macOS package build. Electron Builder notarizes automatically when `build.mac.notarize` is enabled and one complete credential group is present:
+
+- `APPLE_API_KEY`, `APPLE_API_KEY_ID`, and `APPLE_API_ISSUER`
+- `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD`, and `APPLE_TEAM_ID`
+- `APPLE_KEYCHAIN_PROFILE` with optional `APPLE_KEYCHAIN`
 
 ## Environment variables
 
@@ -65,6 +70,9 @@ Artifacts are written to `release/`. macOS builds are currently unsigned.
 | -------------------- | ----------- | ------------------------------------ | ------------------------------------ |
 | `ONEACTION_DEV_URL`  | dev only    | `http://localhost:3000`              | URL loaded by the dev window         |
 | `ONEACTION_URL`      | packaged    | `https://app.oneaction.app/signin`   | URL loaded by the packaged app       |
+| `APPLE_API_KEY` / `APPLE_API_KEY_ID` / `APPLE_API_ISSUER` | macOS release | unset | App Store Connect API key credentials for notarization |
+| `APPLE_ID` / `APPLE_APP_SPECIFIC_PASSWORD` / `APPLE_TEAM_ID` | macOS release | unset | Apple ID credentials for notarization |
+| `APPLE_KEYCHAIN_PROFILE` / `APPLE_KEYCHAIN` | macOS release | unset | Stored `xcrun notarytool` profile for notarization |
 
 ## Project structure
 
